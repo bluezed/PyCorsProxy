@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+env/
+.env
+
+# Cache
+cache.db
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+*.swp
+*.swo
