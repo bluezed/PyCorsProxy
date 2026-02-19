@@ -16,7 +16,9 @@ from urllib.error import URLError, HTTPError
 
 DB_PATH = 'cache.db'
 LOG_FILE = None
-LOG_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+CACHE_TTL = 10 * 60 * 60  # 10 hours in seconds
+PURGE_INTERVAL = 3600  # Purge old entries every hour
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -41,9 +43,17 @@ def get_cached(url):
     conn.close()
     if row:
         content, content_type, timestamp = row
-        if content and time.time() - timestamp < 3600:
+        if content and time.time() - timestamp < CACHE_TTL:
             return content, content_type
     return None, None
+
+
+def purge_old_cache():
+    """Remove cache entries older than CACHE_TTL."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('DELETE FROM cache WHERE timestamp < ?', (int(time.time()) - CACHE_TTL,))
+    conn.commit()
+    conn.close()
 
 def cache_response(url, content, content_type):
     conn = sqlite3.connect(DB_PATH)
@@ -60,8 +70,9 @@ def log_to_file(message):
             # Check file size and rotate if needed
             if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_SIZE:
                 os.rename(LOG_FILE, LOG_FILE + '.old')
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
             with open(LOG_FILE, 'a') as f:
-                f.write(message + '\n')
+                f.write(f'[{timestamp}] {message}\n')
         except OSError:
             pass
 
@@ -79,6 +90,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(f'{{"error": "{message}"}}'.encode())
 
     def do_GET(self):
+        # Reject malformed requests (non-GET methods or malformed request lines)
+        if self.command != 'GET':
+            return
         if not self.path.startswith('/proxy'):
             return
 
@@ -106,6 +120,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(content_bytes)))
             self.end_headers()
             self.wfile.write(content_bytes)
+            log_to_file(f'HIT - {url}')
             return
 
         try:
@@ -123,6 +138,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
                 self.wfile.write(content)
+                log_to_file(f'MISS - {url}')
         except HTTPError as e:
             self.send_error_response(502, f'HTTP Error: {e.code} {e.reason}')
         except URLError as e:
@@ -131,6 +147,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error_response(502, str(e))
 
     def do_OPTIONS(self):
+        # Reject malformed requests (non-OPTIONS methods or malformed request lines)
+        if self.command != 'OPTIONS':
+            return
         if self.path.startswith('/proxy'):
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -141,8 +160,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         msg = f"{self.address_string()} - {format % args}"
-        print(msg)
         log_to_file(msg)
+        if not LOG_FILE:
+            print(msg)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyCorsProxy - A simple CORS proxy with SQLite caching.')
@@ -157,6 +177,19 @@ if __name__ == '__main__':
         log_to_file(f'Starting PyCorsProxy on {args.host}:{args.port}')
 
     init_db()
+    purge_old_cache()  # Clean old entries on startup
+
+    last_purge_time = time.time()
     server = HTTPServer((args.host, args.port), ProxyHandler)
     print(f'Proxy server running on http://{args.host}:{args.port}')
-    server.serve_forever()
+
+    try:
+        while True:
+            server.handle_request()  # Handle one request at a time
+            # Check if it's time to purge old cache entries
+            if time.time() - last_purge_time >= PURGE_INTERVAL:
+                purge_old_cache()
+                last_purge_time = time.time()
+    except KeyboardInterrupt:
+        pass
+    server.server_close()
